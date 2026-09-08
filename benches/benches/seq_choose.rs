@@ -99,6 +99,7 @@ pub fn bench(c: &mut Criterion) {
     bench_rng::<rand_pcg::Pcg64>(c, "Pcg64");
 
     bench_fast_nth(c);
+    bench_unhinted(c);
 }
 
 fn bench_fast_nth(c: &mut Criterion) {
@@ -106,11 +107,11 @@ fn bench_fast_nth(c: &mut Criterion) {
 
     // This models a large iterator which can seek efficiently but cannot report
     // its remaining length. Keep the largest input tractable for the linear-time
-    // implementations so that all three algorithms can be compared directly.
-    for length in [1_000, 1_000_000] {
-        group.bench_with_input(BenchmarkId::new("choose", length), &length, |b, &length| {
+    // implementations so that all four algorithms can be compared directly.
+    for length in [1_000, 1_000_000, 10_000_000] {
+        group.bench_with_input(BenchmarkId::new("choose_old", length), &length, |b, &length| {
             let mut rng = Pcg32::seed_from_u64(123);
-            b.iter(|| UnhintedIteratorWithFastNth::new(length).choose(&mut rng))
+            b.iter(|| choose_old(UnhintedIteratorWithFastNth::new(length), &mut rng))
         });
 
         group.bench_with_input(BenchmarkId::new("choose_stable_old", length), &length, |b, &length| {
@@ -121,6 +122,39 @@ fn bench_fast_nth(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("choose_stable_new", length), &length, |b, &length| {
             let mut rng = Pcg32::seed_from_u64(123);
             b.iter(|| UnhintedIteratorWithFastNth::new(length).choose_stable(&mut rng))
+        });
+
+        group.bench_with_input(BenchmarkId::new("choose_new", length), &length, |b, &length| {
+            let mut rng = Pcg32::seed_from_u64(123);
+            b.iter(|| UnhintedIteratorWithFastNth::new(length).choose(&mut rng))
+        });
+    }
+}
+
+fn bench_unhinted(c: &mut Criterion) {
+    let mut group = c.benchmark_group("choose_unhinted");
+
+    // Unlike `UnhintedIteratorWithFastNth`, this iterator uses the default
+    // linear-time `nth`. This checks the candidate's general streaming case.
+    for length in [1_000, 1_000_000, 10_000_000] {
+        group.bench_with_input(BenchmarkId::new("choose_old", length), &length, |b, &length| {
+            let mut rng = Pcg32::seed_from_u64(123);
+            b.iter(|| choose_old(UnhintedIterator { iter: 0..length }, &mut rng))
+        });
+
+        group.bench_with_input(BenchmarkId::new("choose_stable_old", length), &length, |b, &length| {
+            let mut rng = Pcg32::seed_from_u64(123);
+            b.iter(|| choose_stable_old(UnhintedIterator { iter: 0..length }, &mut rng))
+        });
+
+        group.bench_with_input(BenchmarkId::new("choose_stable_new", length), &length, |b, &length| {
+            let mut rng = Pcg32::seed_from_u64(123);
+            b.iter(|| UnhintedIterator { iter: 0..length }.choose_stable(&mut rng))
+        });
+
+        group.bench_with_input(BenchmarkId::new("choose_new", length), &length, |b, &length| {
+            let mut rng = Pcg32::seed_from_u64(123);
+            b.iter(|| UnhintedIterator { iter: 0..length }.choose(&mut rng))
         });
     }
 }
@@ -205,7 +239,7 @@ impl<I: ExactSizeIterator + Iterator + Clone> Iterator for WindowHintedIterator<
     }
 }
 
-Can#[derive(Clone)]
+#[derive(Clone)]
 struct UnhintedIteratorWithFastNth {
     next: usize,
     end: usize,
@@ -233,6 +267,60 @@ impl Iterator for UnhintedIteratorWithFastNth {
             self.next = value + 1;
             Some(value)
         }
+    }
+}
+
+// The implementation of `choose` before it delegated unknown-size iterators to
+// skip-based reservoir sampling.
+fn choose_old<I, R>(mut iter: I, rng: &mut R) -> Option<I::Item>
+where
+    I: Iterator,
+    R: Rng + ?Sized,
+{
+    let (mut lower, mut upper) = iter.size_hint();
+    let mut result = None;
+
+    if upper == Some(lower) {
+        return match lower {
+            0 => None,
+            1 => iter.next(),
+            _ => iter.nth(rng.random_range(..lower)),
+        };
+    }
+
+    let mut coin_flipper = OldCoinFlipper::new(rng);
+    let mut consumed = 0;
+
+    loop {
+        if lower > 1 {
+            let index = coin_flipper.rng.random_range(..lower + consumed);
+            let skip = if index < lower {
+                result = iter.nth(index);
+                lower - (index + 1)
+            } else {
+                lower
+            };
+            if upper == Some(lower) {
+                return result;
+            }
+            consumed += lower;
+            if skip > 0 {
+                iter.nth(skip - 1);
+            }
+        } else {
+            let element = iter.next();
+            if element.is_none() {
+                return result;
+            }
+            consumed += 1;
+            if coin_flipper.random_ratio_one_over(consumed) {
+                result = element;
+            }
+        }
+
+        let hint = iter.size_hint();
+        lower = hint.0;
+        upper = hint.1;
     }
 }
 

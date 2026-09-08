@@ -26,7 +26,6 @@
 //! `usize` indices are sampled as a `u32` where possible (also providing a
 //! small performance boost in some cases).
 
-mod coin_flipper;
 mod increasing_uniform;
 mod iterator;
 mod slice;

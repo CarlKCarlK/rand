@@ -10,7 +10,6 @@
 
 #[allow(unused)]
 use super::IndexedRandom;
-use super::coin_flipper::CoinFlipper;
 use crate::{Rng, RngExt};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -55,8 +54,8 @@ pub trait IteratorRandom: Iterator + Sized {
     /// Uniformly sample one element
     ///
     /// Assuming that the [`Iterator::size_hint`] is correct, this method
-    /// returns one uniformly-sampled random element of the slice, or `None`
-    /// only if the slice is empty. Incorrect bounds on the `size_hint` may
+    /// returns one uniformly-sampled random element of the iterator, or `None`
+    /// only if the iterator is empty. Incorrect bounds on the `size_hint` may
     /// cause this method to incorrectly return `None` if fewer elements than
     /// the advertised `lower` bound are present and may prevent sampling of
     /// elements beyond an advertised `upper` bound (i.e. incorrect `size_hint`
@@ -65,15 +64,21 @@ pub trait IteratorRandom: Iterator + Sized {
     ///
     /// With an accurate [`Iterator::size_hint`] and where [`Iterator::nth`] is
     /// a constant-time operation, this method can offer `O(1)` performance.
-    /// Where no size hint is
-    /// available, complexity is `O(n)` where `n` is the iterator length.
-    /// Partial hints (where `lower > 0`) also improve performance.
+    /// Where the exact size is unavailable, this uses skip-based reservoir
+    /// sampling. Complexity is `O(n)` where `n` is the iterator length when
+    /// [`Iterator::nth`] is linear, but may be significantly better when
+    /// `nth` can skip elements efficiently.
     ///
     /// Note further that [`Iterator::size_hint`] may affect the number of RNG
     /// samples used as well as the result (while remaining uniform sampling).
     /// Consider instead using [`IteratorRandom::choose_stable`] to avoid
     /// [`Iterator`] combinators which only change size hints from affecting the
     /// results.
+    ///
+    /// # Panics
+    ///
+    /// For an iterator without an exact size, panics if selecting an element
+    /// would require consuming more than `u64::MAX` elements.
     ///
     /// # Example
     ///
@@ -87,54 +92,19 @@ pub trait IteratorRandom: Iterator + Sized {
     where
         R: Rng + ?Sized,
     {
-        let (mut lower, mut upper) = self.size_hint();
-        let mut result = None;
+        let (lower, upper) = self.size_hint();
 
         // Handling for this condition outside the loop allows the optimizer to eliminate the loop
         // when the Iterator is an ExactSizeIterator. This has a large performance impact on e.g.
         // seq_iter_choose_from_1000.
         if upper == Some(lower) {
-            return match lower {
+            match lower {
                 0 => None,
                 1 => self.next(),
                 _ => self.nth(rng.random_range(..lower)),
-            };
-        }
-
-        let mut coin_flipper = CoinFlipper::new(rng);
-        let mut consumed = 0;
-
-        // Continue until the iterator is exhausted
-        loop {
-            if lower > 1 {
-                let ix = coin_flipper.rng.random_range(..lower + consumed);
-                let skip = if ix < lower {
-                    result = self.nth(ix);
-                    lower - (ix + 1)
-                } else {
-                    lower
-                };
-                if upper == Some(lower) {
-                    return result;
-                }
-                consumed += lower;
-                if skip > 0 {
-                    self.nth(skip - 1);
-                }
-            } else {
-                let elem = self.next();
-                if elem.is_none() {
-                    return result;
-                }
-                consumed += 1;
-                if coin_flipper.random_ratio_one_over(consumed) {
-                    result = elem;
-                }
             }
-
-            let hint = self.size_hint();
-            lower = hint.0;
-            upper = hint.1;
+        } else {
+            self.choose_stable(rng)
         }
     }
 
@@ -682,7 +652,7 @@ mod test {
 
         assert_eq!(choose([].iter().cloned()), None);
         assert_eq!(choose(0..100), Some(33));
-        assert_eq!(choose(UnhintedIterator { iter: 0..100 }), Some(27));
+        assert_eq!(choose(UnhintedIterator { iter: 0..100 }), Some(77));
         assert_eq!(
             choose(ChunkHintedIterator {
                 iter: 0..100,
@@ -690,7 +660,7 @@ mod test {
                 chunk_remaining: 32,
                 hint_total_size: false,
             }),
-            Some(91)
+            Some(77)
         );
         assert_eq!(
             choose(ChunkHintedIterator {
@@ -699,7 +669,7 @@ mod test {
                 chunk_remaining: 32,
                 hint_total_size: true,
             }),
-            Some(91)
+            Some(77)
         );
         assert_eq!(
             choose(WindowHintedIterator {
@@ -707,7 +677,7 @@ mod test {
                 window_size: 32,
                 hint_total_size: false,
             }),
-            Some(34)
+            Some(77)
         );
         assert_eq!(
             choose(WindowHintedIterator {
@@ -715,7 +685,7 @@ mod test {
                 window_size: 32,
                 hint_total_size: true,
             }),
-            Some(34)
+            Some(77)
         );
     }
 
