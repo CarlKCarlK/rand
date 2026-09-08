@@ -15,6 +15,26 @@ use crate::{Rng, RngExt};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+/// Equivalent to [`Iterator::nth`], but accepts a zero-based `u128` index.
+///
+/// An index which fits in `usize` requires one call to [`Iterator::nth`].
+/// Larger indices are handled by repeatedly calling `nth(usize::MAX)`, each
+/// time discarding `usize::MAX + 1` items, before retrieving the target item.
+#[inline]
+fn nth_u128<I: Iterator>(iter: &mut I, mut n: u128) -> Option<I::Item> {
+    const USIZE_MAX: u128 = usize::MAX as u128;
+    const CHUNK: u128 = USIZE_MAX + 1;
+
+    // This branch is usually easy to predict: for nearly all calls it is
+    // immediately false; for larger indices it remains true until the final chunk.
+    while n > USIZE_MAX {
+        iter.nth(usize::MAX)?;
+        n -= CHUNK;
+    }
+
+    iter.nth(n as usize)
+}
+
 /// Extension trait on iterators, providing random sampling methods.
 ///
 /// This trait is implemented on all iterators `I` where `I: Iterator + Sized`
@@ -120,68 +140,58 @@ pub trait IteratorRandom: Iterator + Sized {
 
     /// Uniformly sample one element (stable)
     ///
-    /// This method is very similar to [`choose`] except that the result
+    /// This method is very similar to [`choose`] except that the selected index
     /// only depends on the length of the iterator and the values produced by
-    /// `rng`. Notably for any iterator of a given length this will make the
-    /// same requests to `rng` and if the same sequence of values are produced
-    /// the same index will be selected from `self`. This may be useful if you
+    /// `rng`. Notably, for any iterator of a given length, this will make the
+    /// same requests to `rng` and, if `rng` produces the same sequence of
+    /// values, will select the same index from `self`. This may be useful if you
     /// need consistent results no matter what type of iterator you are working
-    /// with. If you do not need this stability prefer [`choose`].
+    /// with. If you do not need this stability, prefer [`choose`].
     ///
-    /// Note that this method still uses [`Iterator::size_hint`] to skip
-    /// constructing elements where possible, however the selection and `rng`
-    /// calls are the same in the face of this optimization. If you want to
-    /// force every element to be created regardless call `.inspect(|e| ())`.
+    /// This method makes `O(log n)` calls to `rng` in expectation, where `n`
+    /// is the iterator length.
+    ///
+    /// This method may use [`Iterator::nth`] to efficiently skip elements
+    /// which cannot be selected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if selecting an element would require consuming more than
+    /// `u64::MAX` elements.
     ///
     /// [`choose`]: IteratorRandom::choose
-    //
-    // Clippy is wrong here: we need to iterate over all entries with the RNG to
-    // ensure that choosing is *stable*.
-    // "allow(unknown_lints)" can be removed when switching to at least
-    // rust-version 1.86.0, see:
-    // https://rust-lang.github.io/rust-clippy/master/index.html#double_ended_iterator_last
-    #[allow(unknown_lints)]
-    #[allow(clippy::double_ended_iterator_last)]
     fn choose_stable<R>(mut self, rng: &mut R) -> Option<Self::Item>
     where
         R: Rng + ?Sized,
     {
-        let mut consumed = 0;
-        let mut result = None;
-        let mut coin_flipper = CoinFlipper::new(rng);
+        let mut result = self.next()?;
+        let mut consumed = 1u128;
+
+        // K=1 case of the skip method from Park et al. (2004):
+        // "Reservoir-based Random Sampling with Replacement from Data Stream".
+        // https://doi.org/10.1137/1.9781611972740.53
+        const SCALE: u128 = 1 << 64;
+        const MAX_POSITION: u128 = u64::MAX as u128;
 
         loop {
-            // Currently the only way to skip elements is `nth()`. So we need to
-            // store what index to access next here.
-            // This should be replaced by `advance_by()` once it is stable:
-            // https://github.com/rust-lang/rust/issues/77404
-            let mut next = 0;
+            // Sample r uniformly from 2^63 equally spaced points in (0, 1),
+            // represented exactly as `numerator / SCALE`.
+            let numerator = u128::from(rng.next_u64() >> 1) * 2 + 1;
 
-            let (lower, _) = self.size_hint();
-            if lower >= 2 {
-                let highest_selected = (0..lower)
-                    .filter(|ix| coin_flipper.random_ratio_one_over(consumed + ix + 1))
-                    .last();
+            // ceil(r * consumed / (1 - r))
+            // = ceil(numerator * consumed / (SCALE - numerator)).
+            let distance = (numerator * consumed).div_ceil(SCALE - numerator);
+            debug_assert_ne!(distance, 0);
 
-                consumed += lower;
-                next = lower;
-
-                if let Some(ix) = highest_selected {
-                    result = self.nth(ix);
-                    next -= ix + 1;
-                    debug_assert!(result.is_some(), "iterator shorter than size_hint().0");
-                }
-            }
-
-            let elem = self.nth(next);
-            if elem.is_none() {
-                return result;
-            }
-
-            if coin_flipper.random_ratio_one_over(consumed + 1) {
-                result = elem;
-            }
-            consumed += 1;
+            let Some(new_result) = nth_u128(&mut self, distance - 1) else {
+                return Some(result);
+            };
+            result = new_result;
+            consumed += distance;
+            assert!(
+                consumed <= MAX_POSITION,
+                "selecting an element would require consuming more than u64::MAX elements"
+            );
         }
     }
 
@@ -289,6 +299,33 @@ mod test {
     use super::*;
     #[cfg(all(feature = "alloc", not(feature = "std")))]
     use alloc::vec::Vec;
+    use core::convert::Infallible;
+
+    // Wraps an RNG and counts how many times it is called.
+    struct CountingRng<R> {
+        inner: R,
+        calls: usize,
+    }
+
+    impl<R: Rng> crate::TryRng for CountingRng<R> {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            self.calls += 1;
+            Ok(self.inner.next_u32())
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            self.calls += 1;
+            Ok(self.inner.next_u64())
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            self.calls += 1;
+            self.inner.fill_bytes(dst);
+            Ok(())
+        }
+    }
 
     #[derive(Clone)]
     struct UnhintedIterator<I: Iterator + Clone> {
@@ -299,6 +336,33 @@ mod test {
 
         fn next(&mut self) -> Option<Self::Item> {
             self.iter.next()
+        }
+    }
+
+    // This synthetic iterator could provide an exact size hint, but deliberately
+    // omits it to test efficient skipping via `nth` independently of size hints.
+    // A real iterator may similarly support fast seeking without knowing its size.
+    struct UnhintedIteratorWithFastNth {
+        next: u128,
+        end: u128,
+    }
+
+    impl Iterator for UnhintedIteratorWithFastNth {
+        type Item = u128;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.nth(0)
+        }
+
+        fn nth(&mut self, n: usize) -> Option<Self::Item> {
+            let value = self.next + n as u128;
+            if value >= self.end {
+                self.next = self.end;
+                None
+            } else {
+                self.next = value + 1;
+                Some(value)
+            }
         }
     }
 
@@ -549,6 +613,44 @@ mod test {
     }
 
     #[test]
+    fn test_iterator_choose_stable_skip_boundaries() {
+        let mut zero = crate::test::const_rng(0);
+        assert_eq!(
+            UnhintedIterator { iter: 0..3 }.choose_stable(&mut zero),
+            Some(2)
+        );
+
+        let mut max = crate::test::const_rng(u64::MAX);
+        assert_eq!(
+            UnhintedIterator { iter: 0..3 }.choose_stable(&mut max),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_nth_u128_above_usize_max() {
+        let index = usize::MAX as u128 + 5;
+        let mut iter = UnhintedIteratorWithFastNth {
+            next: 0,
+            end: index + 1,
+        };
+
+        assert_eq!(nth_u128(&mut iter, index), Some(index));
+    }
+
+    #[test]
+    fn test_iterator_choose_stable_rng_efficiency() {
+        let mut rng = CountingRng {
+            inner: crate::test::rng(123),
+            calls: 0,
+        };
+        let result = UnhintedIterator { iter: 0..1_000_000 }.choose_stable(&mut rng);
+
+        assert!(result.is_some());
+        assert!(rng.calls < 100, "used {} RNG calls", rng.calls);
+    }
+
+    #[test]
     #[cfg(feature = "alloc")]
     fn test_sample_iter() {
         let min_val = 1;
@@ -625,8 +727,8 @@ mod test {
         }
 
         assert_eq!(choose([].iter().cloned()), None);
-        assert_eq!(choose(0..100), Some(27));
-        assert_eq!(choose(UnhintedIterator { iter: 0..100 }), Some(27));
+        assert_eq!(choose(0..100), Some(77));
+        assert_eq!(choose(UnhintedIterator { iter: 0..100 }), Some(77));
         assert_eq!(
             choose(ChunkHintedIterator {
                 iter: 0..100,
@@ -634,7 +736,7 @@ mod test {
                 chunk_remaining: 32,
                 hint_total_size: false,
             }),
-            Some(27)
+            Some(77)
         );
         assert_eq!(
             choose(ChunkHintedIterator {
@@ -643,7 +745,7 @@ mod test {
                 chunk_remaining: 32,
                 hint_total_size: true,
             }),
-            Some(27)
+            Some(77)
         );
         assert_eq!(
             choose(WindowHintedIterator {
@@ -651,7 +753,7 @@ mod test {
                 window_size: 32,
                 hint_total_size: false,
             }),
-            Some(27)
+            Some(77)
         );
         assert_eq!(
             choose(WindowHintedIterator {
@@ -659,7 +761,7 @@ mod test {
                 window_size: 32,
                 hint_total_size: true,
             }),
-            Some(27)
+            Some(77)
         );
     }
 
