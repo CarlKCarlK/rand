@@ -149,8 +149,10 @@ pub trait IteratorRandom: Iterator + Sized {
             let numerator = u128::from(rng.next_u64() >> 1) * 2 + 1;
 
             // ceil(r * consumed / (1 - r))
-            // = ceil(consumed * SCALE / (SCALE - numerator)) - consumed.
-            let distance = (consumed * SCALE).div_ceil(SCALE - numerator) - consumed;
+            // = ceil(consumed * SCALE / denominator) - consumed, where
+            // denominator = SCALE - numerator represents (1 - r).
+            let denominator = SCALE - numerator;
+            let distance = (consumed * SCALE).div_ceil(denominator) - consumed;
             debug_assert_ne!(distance, 0);
 
             let Some(new_result) = nth_u128(&mut self, distance - 1) else {
